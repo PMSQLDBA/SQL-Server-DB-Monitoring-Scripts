@@ -21,10 +21,10 @@ USE [msdb];
 GO
 
 DECLARE @JobName    SYSNAME       = N'DBA - SQL Server Health Check (Consolidated)';
-DECLARE @ScriptDir  NVARCHAR(400) = N'C:\DBA\SqlHealthCheck';
-DECLARE @SmtpServer NVARCHAR(200) = N'smtp.yourcompany.local';
-DECLARE @MailFrom   NVARCHAR(200) = N'sql-healthcheck@yourcompany.local';
-DECLARE @MailTo     NVARCHAR(400) = N'dba-team@yourcompany.local';   -- comma-separate for multiple
+DECLARE @ScriptDir  NVARCHAR(400) = N'E:\1_All_SWs\PS_MonitoringScripts';
+DECLARE @SmtpServer NVARCHAR(200) = N'smtp.gmail.com';
+DECLARE @MailFrom   NVARCHAR(200) = N'praveensqldba12@gmail.com';
+DECLARE @MailTo     NVARCHAR(400) = N'praveensqldba12@gmail.com';   -- comma-separate for multiple
 DECLARE @OwnerLogin SYSNAME       = SUSER_SNAME();  -- job owner (defaults to you)
 
 /* Build the powershell command line. -ExecutionPolicy Bypass avoids policy blocks;
