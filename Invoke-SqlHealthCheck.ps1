@@ -89,6 +89,13 @@ $Thresholds = @{
     QueryTimeoutSec       = 45
 }
 
+# Error-log patterns. xp_readerrorlog does a substring search per term, so we run it
+# once per term and merge. These catch login failures ("Login failed for user..."),
+# numbered errors, severity 16-25, and other real problems. Tune to your noise profile.
+$ErrorLogSearchTerms   = @('Login failed','Error:','Severity: 1','Severity: 2','failed','corrupt','deadlock','cannot')
+# Any captured line matching one of these escalates the whole check to CRITICAL.
+$ErrorLogCriticalTerms = @('Severity: 2','corrupt','consistency','I/O error','stack dump','has encountered','823','824','825')
+
 # House palette (SQL DBA Champs)
 $Brand = @{
     Navy    = '#1F3864'
@@ -145,7 +152,19 @@ function Invoke-HcQuery {
         $ds = New-Object System.Data.DataSet
         [void]$adapter.Fill($ds)
         if ($ds.Tables.Count -eq 0) { return @() }
-        return $ds.Tables[0] | ForEach-Object { $_ }   # DataRow -> pipeline
+        # Project DataRows into clean PSCustomObjects (column values only, DBNull -> $null)
+        # so downstream rendering never sees DataRow base members (RowState, ItemArray, ...).
+        $table = $ds.Tables[0]
+        $cols  = @($table.Columns | ForEach-Object { $_.ColumnName })
+        foreach ($row in $table.Rows) {
+            $o = [ordered]@{}
+            foreach ($c in $cols) {
+                $v = $row[$c]
+                if ($v -is [System.DBNull]) { $v = $null }
+                $o[$c] = $v
+            }
+            [pscustomobject]$o
+        }
     }
     finally { $conn.Close(); $conn.Dispose() }
 }
@@ -205,7 +224,6 @@ ORDER BY d.name;
 "@
 
 $Q.FailedJobs = @"
-DECLARE \$w INT = $($Thresholds.FailedJobWindowHours);
 SELECT j.name AS JobName,
        msdb.dbo.agent_datetime(h.run_date, h.run_time) AS LastRunTime,
        h.run_status AS RunStatus,
@@ -213,9 +231,9 @@ SELECT j.name AS JobName,
 FROM msdb.dbo.sysjobs j
 JOIN msdb.dbo.sysjobhistory h ON h.job_id = j.job_id AND h.step_id = 0
 WHERE h.run_status = 0
-  AND msdb.dbo.agent_datetime(h.run_date, h.run_time) >= DATEADD(HOUR, -\$w, GETDATE())
+  AND msdb.dbo.agent_datetime(h.run_date, h.run_time) >= DATEADD(HOUR, -$($Thresholds.FailedJobWindowHours), GETDATE())
 ORDER BY LastRunTime DESC;
-"@.Replace('\$','@')
+"@
 
 $Q.Blocking = @"
 SELECT r.session_id            AS BlockedSpid,
@@ -232,7 +250,6 @@ ORDER BY r.wait_time DESC;
 "@
 
 $Q.LongRunning = @"
-DECLARE \$s INT = $($Thresholds.LongRunSeconds);
 SELECT r.session_id AS Spid, s.login_name AS LoginName,
        DB_NAME(r.database_id) AS DatabaseName, r.status AS Status, r.command AS Command,
        CAST(r.total_elapsed_time/1000.0 AS DECIMAL(10,1)) AS ElapsedSeconds,
@@ -241,9 +258,9 @@ FROM sys.dm_exec_requests r
 JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id
 OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t
 WHERE r.session_id <> @@SPID AND s.is_user_process = 1
-  AND r.total_elapsed_time/1000.0 >= \$s
+  AND r.total_elapsed_time/1000.0 >= $($Thresholds.LongRunSeconds)
 ORDER BY r.total_elapsed_time DESC;
-"@.Replace('\$','@')
+"@
 
 $Q.Cpu = @"
 SELECT TOP 1 SQLProcessUtilization, SystemIdle,
@@ -271,19 +288,28 @@ SELECT
 FROM sys.dm_os_sys_memory;
 "@
 
+# Build one INSERT..EXEC per search term (xp_readerrorlog can't OR terms in a single call).
+$elInserts = ($ErrorLogSearchTerms | ForEach-Object {
+    "INSERT INTO #el EXEC sys.xp_readerrorlog 0, 1, N'$($_.Replace("'","''"))', NULL, @start, NULL, N'desc';"
+}) -join "`n"
+
+# NOTE: xp_readerrorlog requires securityadmin membership (or GRANT EXEC on it).
 $Q.ErrorLog = @"
-DECLARE \$start DATETIME = DATEADD(HOUR, -$($Thresholds.ErrorLogWindowHours), GETDATE());
 IF OBJECT_ID('tempdb..#el') IS NOT NULL DROP TABLE #el;
 CREATE TABLE #el (LogDate DATETIME, ProcessInfo NVARCHAR(100), [Text] NVARCHAR(MAX));
-INSERT INTO #el EXEC sys.xp_readerrorlog 0, 1, N'error', NULL, \$start, NULL, N'desc';
-SELECT TOP 40 LogDate, ProcessInfo, LEFT([Text],300) AS [Text]
+DECLARE @start DATETIME = DATEADD(HOUR, -$($Thresholds.ErrorLogWindowHours), GETDATE());
+$elInserts
+SELECT DISTINCT TOP 60
+    CONVERT(VARCHAR(19), LogDate, 120) AS LogTime,
+    LTRIM(RTRIM(ProcessInfo))         AS Source,
+    LEFT(LTRIM([Text]), 400)          AS ErrorMessage
 FROM #el
-WHERE [Text] NOT LIKE '%0 error%'
-  AND [Text] NOT LIKE '%without errors%'
-  AND [Text] NOT LIKE '%error log%'
-ORDER BY LogDate DESC;
+WHERE [Text] NOT LIKE '%Login succeeded%'
+  AND [Text] NOT LIKE '%error log has been reinitialized%'
+  AND [Text] NOT LIKE '%This instance of SQL Server has been using a process ID%'
+ORDER BY LogTime DESC;
 DROP TABLE #el;
-"@.Replace('\$','@')
+"@
 
 # =====================================================================================
 # 4. Per-server evaluation
@@ -355,7 +381,8 @@ function Test-ServerHealth {
         $flag = foreach ($r in $rows) {
             $ageFull = if ($r.LastFull -is [datetime]) { ($now - $r.LastFull).TotalHours } else { [double]::MaxValue }
             $ageLog  = if ($r.LastLog  -is [datetime]) { ($now - $r.LastLog ).TotalHours } else { [double]::MaxValue }
-            $needLog = $r.RecoveryModel -in @('FULL','BULK_LOGGED')
+            $isSystem = $r.DatabaseName -in @('master','model','msdb')
+            $needLog  = ($r.RecoveryModel -in @('FULL','BULK_LOGGED')) -and -not $isSystem
             $s = 'OK'
             if     ($ageFull -ge $Thresholds.FullBackupCritHours) { $s = 'CRITICAL' }
             elseif ($ageFull -ge $Thresholds.FullBackupWarnHours) { $s = 'WARNING' }
@@ -428,8 +455,19 @@ function Test-ServerHealth {
     # --- Error log ---
     try {
         $rows = @(Invoke-HcQuery -Instance $Instance -Query $Q.ErrorLog)
-        $st   = if ($rows.Count -ge 5) {'WARNING'} elseif ($rows.Count) {'WARNING'} else {'OK'}
-        $sum  = if ($rows.Count) { "$($rows.Count) error entr(y/ies) in last $($Thresholds.ErrorLogWindowHours)h" } else { "No errors in last $($Thresholds.ErrorLogWindowHours)h" }
+        $hasCrit = @($rows | Where-Object {
+            $m = [string]$_.ErrorMessage
+            ($ErrorLogCriticalTerms | Where-Object { $m -like "*$_*" }).Count -gt 0
+        }).Count
+        $logins  = @($rows | Where-Object { [string]$_.ErrorMessage -like '*Login failed*' }).Count
+        $st  = if ($hasCrit) {'CRITICAL'} elseif ($rows.Count) {'WARNING'} else {'OK'}
+        $sum = if ($rows.Count) {
+            $extra = @()
+            if ($hasCrit) { $extra += "$hasCrit severe" }
+            if ($logins)  { $extra += "$logins login failure(s)" }
+            $tail = if ($extra) { " ($($extra -join ', '))" } else { '' }
+            "$($rows.Count) error entr(y/ies) in last $($Thresholds.ErrorLogWindowHours)h$tail"
+        } else { "No errors in last $($Thresholds.ErrorLogWindowHours)h" }
         $server.Checks += New-Check 'Error Log' $st $sum $rows
     } catch { $server.Checks += New-Check 'Error Log' 'ERROR' $_.Exception.Message }
 

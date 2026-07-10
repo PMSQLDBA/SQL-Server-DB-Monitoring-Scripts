@@ -86,7 +86,7 @@ All thresholds live in the `$Thresholds` hashtable at the top of the script — 
 
 - `Send-MailMessage` is deprecated by Microsoft but remains the practical on-prem SMTP-relay standard; swap in MailKit if your shop requires it.
 - The disk check reports only volumes that host database files (the ones that matter). Add a CIM/WMI branch if you want every volume.
-- Error-log grading is a simple count heuristic; tune the search string / exclusions in the `$Q.ErrorLog` query for your noise profile.
+- **Error log**: searches multiple patterns (login failures, `Error:`, Severity 16-25, `failed`, `corrupt`, `deadlock`, `cannot`) so messages like *"Login failed for user 'DevUser'..."* are captured, and shows the full message text. Severe entries (corruption, Severity 20+, I/O errors 823-825, stack dumps) escalate the check to CRITICAL. Tune `$ErrorLogSearchTerms` / `$ErrorLogCriticalTerms` near the top of the script. Note: `xp_readerrorlog` needs **securityadmin** membership (or `GRANT EXECUTE`) on each target - grant it to the monitoring account alongside `VIEW SERVER STATE`.
 
 ---
 PMSQLDBA · sqldbachamps.com
