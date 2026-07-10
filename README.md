@@ -1,0 +1,92 @@
+# Centralized SQL Server Health Check
+
+**SQL DBA Champs** · one script, all your on-prem instances, one HTML/Excel report, one email.
+
+## Why the central-orchestrator pattern (not per-server Agent jobs)
+
+A per-instance Agent job can't tell you the service is **down** (a dead instance can't run its own job), and stitching many jobs into *one* consolidated email is painful. Instead, one PowerShell script runs from a central monitor box, connects out to every instance, and produces a single rolled-up report. Schedule that one script with a SQL Agent **CmdExec** job or Task Scheduler.
+
+```
+  [ Monitor box ]  Invoke-SqlHealthCheck.ps1
+        |  reads servers.txt
+        |  connects out (ADO.NET, Windows/SQL auth)
+        v
+  VMSQL01  VMSQL02  VMSQL03 ...   -> collect checks
+        |
+        v
+  HealthCheck_YYYYMMDD_HHMM.html  +  .xlsx   -> ONE email to the DBA team
+```
+
+## What it checks (per instance)
+
+| Check | Source | Signals |
+|---|---|---|
+| SQL Server service status | connection test (+ optional CIM) | reachable = running |
+| Disk space | `sys.dm_os_volume_stats` | % free per volume |
+| Database backup status | `msdb.dbo.backupset` | stale/missing full & log backups |
+| Failed SQL Agent jobs | `msdb` job history | failures in last N hours |
+| Blocking sessions | `sys.dm_exec_requests` | blocked SPIDs + wait time |
+| Long-running sessions | `sys.dm_exec_requests` | user sessions over threshold |
+| Database status | `sys.databases` | anything not `ONLINE` |
+| Error log | `xp_readerrorlog` | error entries in last N hours |
+| CPU usage | scheduler ring buffer | SQL process CPU % |
+| Memory usage | `sys.dm_os_sys_memory` | OS available MB + memory state |
+
+Every check is graded **OK / WARNING / CRITICAL**; each server rolls up to its worst check.
+
+## Files
+
+- `Invoke-SqlHealthCheck.ps1` — the orchestrator (no modules required; pure ADO.NET)
+- `servers.txt` — your instance list, one per line
+- `Deploy-HealthCheckAgentJob.sql` — creates the scheduled SQL Agent job
+- `Reports/` — generated HTML/Excel land here
+
+## Requirements
+
+- **Windows PowerShell 5.1** (or PowerShell 7). No SqlServer/dbatools module needed.
+- Optional: `ImportExcel` module for a real multi-sheet `.xlsx` (`Install-Module ImportExcel`). Without it you get a summary `.csv`.
+- On each **target** instance, the running account needs `VIEW SERVER STATE` and read access to `msdb`:
+  ```sql
+  -- run on every target instance
+  CREATE LOGIN [DOMAIN\SqlHealthCheckSvc] FROM WINDOWS;   -- or a SQL login
+  GRANT VIEW SERVER STATE TO [DOMAIN\SqlHealthCheckSvc];
+  USE msdb; CREATE USER [DOMAIN\SqlHealthCheckSvc] FOR LOGIN [DOMAIN\SqlHealthCheckSvc];
+  EXEC sp_addrolemember N'SQLAgentReaderRole', N'DOMAIN\SqlHealthCheckSvc';
+  ```
+- SMTP relay reachable from the monitor box.
+
+## Run it manually
+
+```powershell
+# Windows auth, using servers.txt next to the script
+.\Invoke-SqlHealthCheck.ps1 `
+    -SmtpServer smtp.yourcompany.local `
+    -MailFrom sql-healthcheck@yourcompany.local `
+    -MailTo dba-team@yourcompany.local
+
+# Generate reports but don't email (great for first run)
+.\Invoke-SqlHealthCheck.ps1 -NoEmail
+
+# SQL authentication
+.\Invoke-SqlHealthCheck.ps1 -SqlAuth -SqlUser hc_reader -SqlPassword '***' -NoEmail
+
+# Also verify the Windows service state via CIM (needs remoting)
+.\Invoke-SqlHealthCheck.ps1 -CheckWindowsService -NoEmail
+```
+
+## Schedule it
+
+Edit the paths/SMTP at the top of `Deploy-HealthCheckAgentJob.sql`, then run it on the **monitor** instance. It creates a daily 07:00 CmdExec job that calls the script. (CmdExec is used instead of the legacy SQLPS PowerShell subsystem, which is a constrained host that breaks modern scripts.)
+
+## Tuning
+
+All thresholds live in the `$Thresholds` hashtable at the top of the script — disk %, backup age, long-run seconds, CPU %, memory MB, lookback windows, connect/query timeouts. Change once, applies to every server. The report palette is in `$Brand`.
+
+## Notes
+
+- `Send-MailMessage` is deprecated by Microsoft but remains the practical on-prem SMTP-relay standard; swap in MailKit if your shop requires it.
+- The disk check reports only volumes that host database files (the ones that matter). Add a CIM/WMI branch if you want every volume.
+- Error-log grading is a simple count heuristic; tune the search string / exclusions in the `$Q.ErrorLog` query for your noise profile.
+
+---
+PMSQLDBA · sqldbachamps.com

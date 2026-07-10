@@ -1,0 +1,15 @@
+# Centralized SQL Server Health Check - target instance list
+# One instance per line. Lines starting with # are ignored.
+# Formats accepted:
+#   HOSTNAME                 (default instance, port 1433)
+#   HOSTNAME\INSTANCE        (named instance)
+#   HOSTNAME,1433            (explicit port)
+#   HOSTNAME\INSTANCE,50001  (named instance + port)
+
+VMSQL01
+VMSQL02
+VMSQL03
+
+# PRODSQL01
+# PRODSQL02\FINANCE
+# DRSQL01,1433
