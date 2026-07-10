@@ -37,13 +37,23 @@ param(
     # Where the HTML / Excel report files are written.
     [string]   $OutputPath   = "$PSScriptRoot\Reports",
 
-    # --- Email settings ---
+    # --- Email delivery ---
+    # Preferred: Database Mail (uses a profile you configured in SQL - no passwords here).
+    [switch]   $UseDatabaseMail,
+    [string]   $DbMailProfile,                 # the Database Mail profile name you set up
+    [string]   $DbMailInstance = 'localhost',  # instance that hosts Database Mail (usually the monitor box)
+    [switch]   $AttachExcel,                    # also attach the .xlsx/.csv (watch DB Mail MaxFileSize)
+    [switch]   $NoEmail,                        # generate reports but skip sending
+
+    # Fallback: direct SMTP (Gmail/O365 need auth + TLS on port 587).
     [string]   $SmtpServer   = 'smtp.yourcompany.local',
-    [int]      $SmtpPort     = 25,
+    [int]      $SmtpPort     = 587,
     [string]   $MailFrom     = 'sql-healthcheck@yourcompany.local',
     [string[]] $MailTo       = @('dba-team@yourcompany.local'),
     [switch]   $UseSsl,
-    [switch]   $NoEmail,                 # generate reports but skip sending
+    [string]   $SmtpUser,
+    [string]   $SmtpPassword,                   # Gmail APP PASSWORD, not the normal password
+    [string]   $SmtpCredentialPath,
 
     # --- Authentication ---
     [switch]   $SqlAuth,
@@ -168,6 +178,46 @@ function Invoke-HcQuery {
             }
             [pscustomobject]$o
         }
+    }
+    finally { $conn.Close(); $conn.Dispose() }
+}
+
+function Send-DbMail {
+    <#
+      Sends the report through an existing Database Mail profile via msdb.dbo.sp_send_dbmail.
+      Uses SqlParameters so the HTML body (full of quotes/brackets) is passed safely.
+      NOTE: sp_send_dbmail QUEUES the mail (async) and returns immediately - a successful
+      call means "accepted for delivery", not "delivered". Check msdb.dbo.sysmail_allitems
+      / sysmail_event_log for final status.
+    #>
+    param(
+        [Parameter(Mandatory)] [string] $Instance,
+        [Parameter(Mandatory)] [string] $Profile,
+        [Parameter(Mandatory)] [string] $Recipients,   # semicolon-separated
+        [Parameter(Mandatory)] [string] $Subject,
+        [Parameter(Mandatory)] [string] $HtmlBody,
+        [string] $Attachment
+    )
+    Add-Type -AssemblyName System.Data | Out-Null
+    if ($SqlAuth) { $auth = "User ID=$SqlUser;Password=$SqlPassword" } else { $auth = 'Integrated Security=SSPI' }
+    $connStr = "Server=$Instance;Database=msdb;$auth;Connect Timeout=$($Thresholds.ConnectTimeoutSec);Application Name=SqlHealthCheck;TrustServerCertificate=True"
+
+    $conn = New-Object System.Data.SqlClient.SqlConnection $connStr
+    $conn.Open()
+    try {
+        $cmd = $conn.CreateCommand()
+        $cmd.CommandText = 'msdb.dbo.sp_send_dbmail'
+        $cmd.CommandType = [System.Data.CommandType]::StoredProcedure
+        $cmd.CommandTimeout = 60
+        [void]$cmd.Parameters.AddWithValue('@profile_name', $Profile)
+        [void]$cmd.Parameters.AddWithValue('@recipients',   $Recipients)
+        [void]$cmd.Parameters.AddWithValue('@subject',      $Subject)
+        [void]$cmd.Parameters.AddWithValue('@body',         $HtmlBody)
+        [void]$cmd.Parameters.AddWithValue('@body_format',  'HTML')
+        if ($Attachment -and (Test-Path $Attachment)) {
+            [void]$cmd.Parameters.AddWithValue('@file_attachments', $Attachment)
+        }
+        [void]$cmd.ExecuteNonQuery()
     }
     finally { $conn.Close(); $conn.Dispose() }
 }
@@ -729,20 +779,41 @@ if (-not $NoEmail) {
     $warn = @($results | Where-Object Overall -eq 'WARNING').Count
     $tag  = if ($crit) {"[CRITICAL x$crit]"} elseif ($warn) {"[WARNING x$warn]"} else {'[ALL HEALTHY]'}
     $subject = "SQL Health Check $tag - $($results.Count) servers - $($runTime.ToString('yyyy-MM-dd HH:mm'))"
+    $attach  = if ($AttachExcel) { $excel } else { $null }
 
-    $mail = @{
-        SmtpServer = $SmtpServer; Port = $SmtpPort
-        From = $MailFrom; To = $MailTo
-        Subject = $subject; Body = $html; BodyAsHtml = $true
-        Attachments = $excel
+    if ($UseDatabaseMail) {
+        # ---- Preferred: send through the existing Database Mail profile ----
+        if (-not $DbMailProfile) { throw '-UseDatabaseMail requires -DbMailProfile <profile name>.' }
+        try {
+            Send-DbMail -Instance $DbMailInstance -Profile $DbMailProfile `
+                        -Recipients ($MailTo -join ';') -Subject $subject -HtmlBody $html -Attachment $attach
+            Write-Host "Queued via Database Mail (profile '$DbMailProfile' on $DbMailInstance) to $($MailTo -join ', ')" -ForegroundColor Green
+            Write-Host "  Check delivery: SELECT TOP 20 sent_status,* FROM msdb.dbo.sysmail_allitems ORDER BY mailitem_id DESC;" -ForegroundColor DarkGray
+        } catch {
+            Write-Warning "Database Mail failed: $($_.Exception.Message). Reports are still on disk."
+        }
     }
-    if ($UseSsl) { $mail.UseSsl = $true }
-    try {
-        # Send-MailMessage is deprecated by MS but remains the on-prem SMTP-relay standard.
-        Send-MailMessage @mail -ErrorAction Stop
-        Write-Host "Email sent to $($MailTo -join ', ')" -ForegroundColor Green
-    } catch {
-        Write-Warning "Email failed: $($_.Exception.Message). Reports are still on disk."
+    else {
+        # ---- Fallback: direct SMTP (Gmail/O365 need auth + TLS) ----
+        $cred = $null
+        if     ($SmtpCredentialPath -and (Test-Path $SmtpCredentialPath)) { $cred = Import-Clixml $SmtpCredentialPath }
+        elseif ($SmtpUser) { $cred = New-Object System.Management.Automation.PSCredential($SmtpUser, (ConvertTo-SecureString $SmtpPassword -AsPlainText -Force)) }
+
+        $mail = @{
+            SmtpServer = $SmtpServer; Port = $SmtpPort
+            From = $MailFrom; To = $MailTo
+            Subject = $subject; Body = $html; BodyAsHtml = $true
+        }
+        if ($attach) { $mail.Attachments = $attach }
+        if ($cred)   { $mail.Credential  = $cred }
+        if ($UseSsl -or $SmtpPort -ne 25) { $mail.UseSsl = $true }   # auth relays need TLS
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12  # Gmail rejects TLS 1.0
+            Send-MailMessage @mail -ErrorAction Stop
+            Write-Host "Email sent via SMTP to $($MailTo -join ', ')" -ForegroundColor Green
+        } catch {
+            Write-Warning "SMTP send failed: $($_.Exception.Message). Reports are still on disk."
+        }
     }
 }
 

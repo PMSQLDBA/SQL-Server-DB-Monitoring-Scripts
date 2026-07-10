@@ -60,21 +60,30 @@ Every check is graded **OK / WARNING / CRITICAL**; each server rolls up to its w
 ## Run it manually
 
 ```powershell
-# Windows auth, using servers.txt next to the script
-.\Invoke-SqlHealthCheck.ps1 `
-    -SmtpServer smtp.yourcompany.local `
-    -MailFrom sql-healthcheck@yourcompany.local `
-    -MailTo dba-team@yourcompany.local
-
-# Generate reports but don't email (great for first run)
+# Generate reports only, no email (great for first run)
 .\Invoke-SqlHealthCheck.ps1 -NoEmail
 
-# SQL authentication
-.\Invoke-SqlHealthCheck.ps1 -SqlAuth -SqlUser hc_reader -SqlPassword '***' -NoEmail
+# Deliver through your existing Database Mail profile (recommended - no passwords here)
+.\Invoke-SqlHealthCheck.ps1 `
+    -UseDatabaseMail -DbMailProfile 'SQLHealthCheckProfile' -DbMailInstance 'localhost' `
+    -MailTo 'praveensqldba12@gmail.com'
 
-# Also verify the Windows service state via CIM (needs remoting)
-.\Invoke-SqlHealthCheck.ps1 -CheckWindowsService -NoEmail
+# Also attach the Excel workbook (watch Database Mail's MaxFileSize, default 1 MB)
+.\Invoke-SqlHealthCheck.ps1 -UseDatabaseMail -DbMailProfile 'SQLHealthCheckProfile' -AttachExcel `
+    -MailTo 'praveensqldba12@gmail.com'
+
+# SQL authentication to the targets
+.\Invoke-SqlHealthCheck.ps1 -SqlAuth -SqlUser hc_reader -SqlPassword '***' -NoEmail
 ```
+
+### Email delivery
+
+**Database Mail (recommended).** If you've configured a Database Mail profile, use `-UseDatabaseMail -DbMailProfile '<name>'`. The report is sent with `msdb.dbo.sp_send_dbmail` using that profile, so your SMTP host and Gmail app password stay inside SQL's encrypted config - nothing sensitive touches the command line or the Agent job step. `sp_send_dbmail` queues the mail, so a clean run means "accepted"; confirm actual delivery with:
+```sql
+SELECT TOP 5 sent_status, sent_date, subject FROM msdb.dbo.sysmail_allitems ORDER BY mailitem_id DESC;
+```
+
+**Direct SMTP (fallback).** Without Database Mail you can send straight to Gmail/O365, but they require authentication + TLS: pass `-SmtpServer smtp.gmail.com -SmtpPort 587 -SmtpUser you@gmail.com -SmtpPassword '<APP PASSWORD>'`. Gmail needs a 16-char **App Password** (2-Step Verification must be on) - your normal password will be rejected. For scheduled runs, prefer a secure cred file: `Get-Credential | Export-Clixml smtp.cred` then `-SmtpCredentialPath smtp.cred` (readable only by the account that created it).
 
 ## Schedule it
 
@@ -86,7 +95,7 @@ All thresholds live in the `$Thresholds` hashtable at the top of the script — 
 
 ## Notes
 
-- `Send-MailMessage` is deprecated by Microsoft but remains the practical on-prem SMTP-relay standard; swap in MailKit if your shop requires it.
+- Delivery defaults to Database Mail when `-UseDatabaseMail` is set; otherwise it uses `Send-MailMessage` (deprecated by MS but fine for a relay). The script forces TLS 1.2 and auto-enables SSL on any port other than 25, which is what Gmail/O365 require.
 - **SQL Agent check** uses `sys.dm_server_services`, so it sees the Agent service state even when the database engine is up. A stopped Agent that's set to **Automatic** startup raises WARNING (flip `$Thresholds.AgentStoppedIsCritical` to `$true` for CRITICAL); a stopped Agent on Manual/Disabled startup is treated as intentional and stays OK. When Agent is down, the Failed Agent Jobs check reports "Agent stopped" instead of a misleading "no failed jobs" (nothing runs to fail).
 - **Long-running sessions vs transactions** are two separate checks on purpose. `dm_exec_requests` only shows sessions *actively executing a query right now*, so a `BEGIN TRAN` that never committed (session sleeping / awaiting command) is invisible to it - exactly what `DBCC OPENTRAN` finds. The transactions check keys off `transaction_begin_time` in the tran DMVs, so it catches those idle-but-open transactions (the ones that hold locks and pin the log). Thresholds: `$Thresholds.LongTxnSeconds` / `LongTxnCritSeconds`.
 - The disk check reports only volumes that host database files (the ones that matter). Add a CIM/WMI branch if you want every volume.
