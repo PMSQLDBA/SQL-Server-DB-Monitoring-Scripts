@@ -76,8 +76,11 @@ $Thresholds = @{
     LogBackupWarnHours    = 4        # last LOG (FULL/BULK recovery) older -> WARNING
     LogBackupCritHours    = 12       # last LOG older -> CRITICAL
     FailedJobWindowHours  = 24       # look back this far for failed Agent jobs
-    LongRunSeconds        = 300      # sessions running longer than this are reported
-    LongRunCritSeconds    = 1800     # long-runners past this are CRITICAL
+    AgentStoppedIsCritical = $false  # $true -> a stopped (Automatic) SQL Agent grades CRITICAL, else WARNING
+    LongRunSeconds        = 300      # ACTIVE requests running longer than this are reported
+    LongRunCritSeconds    = 1800     # long-running requests past this are CRITICAL
+    LongTxnSeconds        = 300      # OPEN transactions older than this are reported (even if idle)
+    LongTxnCritSeconds    = 1800     # open transactions past this are CRITICAL
     BlockingWarnSeconds   = 30       # any blocking >= this -> WARNING
     BlockingCritSeconds   = 120      # blocking >= this -> CRITICAL
     CpuWarnPct            = 80       # SQL process CPU% -> WARNING
@@ -193,6 +196,12 @@ function Get-WorstStatus {
 
 $Q = @{}
 
+# Engine, Agent, Browser, Full-text service states from inside SQL (needs VIEW SERVER STATE only).
+$Q.Services = @"
+SELECT servicename, status_desc, startup_type_desc
+FROM sys.dm_server_services;
+"@
+
 $Q.DiskSpace = @"
 SELECT DISTINCT
     vs.volume_mount_point                                             AS Drive,
@@ -262,6 +271,34 @@ WHERE r.session_id <> @@SPID AND s.is_user_process = 1
 ORDER BY r.total_elapsed_time DESC;
 "@
 
+# Long-running OPEN TRANSACTIONS. Unlike dm_exec_requests (active queries only), the
+# transaction DMVs surface a transaction that is open but whose session is idle/sleeping
+# (BEGIN TRAN with no COMMIT) - the classic lock-holder / log-pinner DBCC OPENTRAN finds.
+$Q.LongTxn = @"
+SELECT
+    s.session_id                                           AS Spid,
+    s.login_name                                           AS LoginName,
+    DB_NAME(dbt.database_id)                               AS DatabaseName,
+    DATEDIFF(SECOND, at.transaction_begin_time, GETDATE()) AS DurationSeconds,
+    CONVERT(VARCHAR(19), at.transaction_begin_time, 120)   AS BeginTime,
+    s.status                                               AS SessionStatus,
+    LEFT(ISNULL(s.host_name,''),30)                        AS HostName,
+    LEFT(ISNULL(s.program_name,''),50)                     AS Program,
+    LEFT(ISNULL(txt.text,''),200)                          AS LastQuery
+FROM sys.dm_tran_active_transactions at
+JOIN sys.dm_tran_session_transactions st ON st.transaction_id = at.transaction_id
+JOIN sys.dm_exec_sessions s              ON s.session_id = st.session_id
+OUTER APPLY (SELECT TOP 1 dt.database_id FROM sys.dm_tran_database_transactions dt
+             WHERE dt.transaction_id = at.transaction_id ORDER BY dt.database_id) dbt
+LEFT JOIN sys.dm_exec_connections c      ON c.session_id = s.session_id
+OUTER APPLY sys.dm_exec_sql_text(c.most_recent_sql_handle) txt
+WHERE st.is_user_transaction = 1
+  AND s.is_user_process = 1
+  AND s.session_id <> @@SPID
+  AND at.transaction_begin_time <= DATEADD(SECOND, -$($Thresholds.LongTxnSeconds), GETDATE())
+ORDER BY at.transaction_begin_time ASC;
+"@
+
 $Q.Cpu = @"
 SELECT TOP 1 SQLProcessUtilization, SystemIdle,
        100 - SystemIdle - SQLProcessUtilization AS OtherProcessUtilization
@@ -325,6 +362,7 @@ function Test-ServerHealth {
         Checks       = @()
         Error        = $null
         WindowsSvc   = $null
+        AgentRunning = $null
     }
 
     # --- Optional Windows service state (needs remoting) ---
@@ -348,7 +386,34 @@ function Test-ServerHealth {
         $server.Checks   += New-Check 'SQL Service' 'CRITICAL' 'Cannot connect - service down or unreachable'
         return $server
     }
-    $server.Checks += New-Check 'SQL Service' 'OK' 'Instance reachable (service running)'
+    # --- SQL Service: engine reachable + service inventory (engine, agent, browser, ...) ---
+    $svcRows = @()
+    try { $svcRows = @(Invoke-HcQuery -Instance $Instance -Query $Q.Services) } catch { }
+    $svcInv = @($svcRows | ForEach-Object {
+        [pscustomobject]@{ Service = $_.servicename; Status = $_.status_desc; StartupType = $_.startup_type_desc }
+    })
+    $server.Checks += New-Check 'SQL Service' 'OK' 'Database Engine running' $svcInv
+
+    # --- SQL Agent service state (the gap: engine can be up while Agent is stopped) ---
+    $agent = $svcRows | Where-Object { $_.servicename -like 'SQL Server Agent*' } | Select-Object -First 1
+    if ($agent) {
+        $running = $agent.status_desc -eq 'Running'
+        $server.AgentRunning = $running
+        if ($running) {
+            $server.Checks += New-Check 'SQL Agent' 'OK' "$($agent.servicename) running"
+        }
+        elseif ($agent.startup_type_desc -eq 'Automatic') {
+            $sev = if ($Thresholds.AgentStoppedIsCritical) { 'CRITICAL' } else { 'WARNING' }
+            $server.Checks += New-Check 'SQL Agent' $sev "$($agent.servicename) is STOPPED (startup: Automatic) - scheduled jobs are NOT running"
+        }
+        else {
+            # stopped but Manual/Disabled -> almost certainly intentional, don't cry wolf
+            $server.Checks += New-Check 'SQL Agent' 'OK' "$($agent.servicename) stopped (startup: $($agent.startup_type_desc), not auto-start)"
+        }
+    } else {
+        $server.AgentRunning = $null
+        $server.Checks += New-Check 'SQL Agent' 'OK' 'Agent state unavailable from dm_server_services'
+    }
 
     # --- Disk space ---
     try {
@@ -408,10 +473,15 @@ function Test-ServerHealth {
 
     # --- Failed Agent jobs ---
     try {
-        $rows = @(Invoke-HcQuery -Instance $Instance -Query $Q.FailedJobs)
-        $st   = if ($rows.Count) {'CRITICAL'} else {'OK'}
-        $sum  = if ($rows.Count) { "$($rows.Count) failed job run(s) in last $($Thresholds.FailedJobWindowHours)h" } else { "No failed jobs in last $($Thresholds.FailedJobWindowHours)h" }
-        $server.Checks += New-Check 'Failed Agent Jobs' $st $sum $rows
+        if ($server.AgentRunning -eq $false) {
+            # Agent is down: "no failed jobs" would be a false OK because nothing is running.
+            $server.Checks += New-Check 'Failed Agent Jobs' 'WARNING' 'SQL Server Agent is stopped - no jobs are running to succeed or fail'
+        } else {
+            $rows = @(Invoke-HcQuery -Instance $Instance -Query $Q.FailedJobs)
+            $st   = if ($rows.Count) {'CRITICAL'} else {'OK'}
+            $sum  = if ($rows.Count) { "$($rows.Count) failed job run(s) in last $($Thresholds.FailedJobWindowHours)h" } else { "No failed jobs in last $($Thresholds.FailedJobWindowHours)h" }
+            $server.Checks += New-Check 'Failed Agent Jobs' $st $sum $rows
+        }
     } catch { $server.Checks += New-Check 'Failed Agent Jobs' 'ERROR' $_.Exception.Message }
 
     # --- Blocking ---
@@ -423,14 +493,26 @@ function Test-ServerHealth {
         $server.Checks += New-Check 'Blocking Sessions' $st $sum $rows
     } catch { $server.Checks += New-Check 'Blocking Sessions' 'ERROR' $_.Exception.Message }
 
-    # --- Long-running ---
+    # --- Long-running requests (active queries) ---
     try {
         $rows = @(Invoke-HcQuery -Instance $Instance -Query $Q.LongRunning)
         $maxE = ($rows | Measure-Object ElapsedSeconds -Maximum).Maximum
         $st   = if ($maxE -ge $Thresholds.LongRunCritSeconds) {'CRITICAL'} elseif ($rows.Count) {'WARNING'} else {'OK'}
-        $sum  = if ($rows.Count) { "$($rows.Count) session(s) > $($Thresholds.LongRunSeconds)s, max $([int]$maxE)s" } else { "None over $($Thresholds.LongRunSeconds)s" }
+        $sum  = if ($rows.Count) { "$($rows.Count) query(ies) > $($Thresholds.LongRunSeconds)s, max $([int]$maxE)s" } else { "None over $($Thresholds.LongRunSeconds)s" }
         $server.Checks += New-Check 'Long-Running Sessions' $st $sum $rows
     } catch { $server.Checks += New-Check 'Long-Running Sessions' 'ERROR' $_.Exception.Message }
+
+    # --- Long-running open transactions (idle or active) ---
+    try {
+        $rows = @(Invoke-HcQuery -Instance $Instance -Query $Q.LongTxn)
+        $maxD = ($rows | Measure-Object DurationSeconds -Maximum).Maximum
+        $st   = if ($maxD -ge $Thresholds.LongTxnCritSeconds) {'CRITICAL'} elseif ($rows.Count) {'WARNING'} else {'OK'}
+        $sum  = if ($rows.Count) {
+            $mins = [math]::Round($maxD/60,1)
+            "$($rows.Count) open transaction(s) > $($Thresholds.LongTxnSeconds)s, oldest $mins min"
+        } else { "None open over $($Thresholds.LongTxnSeconds)s" }
+        $server.Checks += New-Check 'Long-Running Transactions' $st $sum $rows
+    } catch { $server.Checks += New-Check 'Long-Running Transactions' 'ERROR' $_.Exception.Message }
 
     # --- CPU ---
     try {
@@ -510,8 +592,8 @@ function New-HtmlReport {
     param($Servers, [datetime]$RunTime)
     Add-Type -AssemblyName System.Web | Out-Null
 
-    $checkNames = @('SQL Service','Disk Space','Database Status','Backup Status','Failed Agent Jobs',
-                    'Blocking Sessions','Long-Running Sessions','CPU Usage','Memory Usage','Error Log')
+    $checkNames = @('SQL Service','SQL Agent','Disk Space','Database Status','Backup Status','Failed Agent Jobs',
+                    'Blocking Sessions','Long-Running Sessions','Long-Running Transactions','CPU Usage','Memory Usage','Error Log')
 
     # ---- Summary matrix ----
     $matHead = "<th style='padding:8px 10px;text-align:left;background:$($Brand.Navy);color:#fff;font-size:12px'>Instance</th>" +

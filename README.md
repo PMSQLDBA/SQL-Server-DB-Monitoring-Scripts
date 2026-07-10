@@ -22,11 +22,13 @@ A per-instance Agent job can't tell you the service is **down** (a dead instance
 | Check | Source | Signals |
 |---|---|---|
 | SQL Server service status | connection test (+ optional CIM) | reachable = running |
+| SQL Server Agent status | `sys.dm_server_services` | Agent Running/Stopped; alerts only if stopped while set to auto-start |
 | Disk space | `sys.dm_os_volume_stats` | % free per volume |
 | Database backup status | `msdb.dbo.backupset` | stale/missing full & log backups |
 | Failed SQL Agent jobs | `msdb` job history | failures in last N hours |
 | Blocking sessions | `sys.dm_exec_requests` | blocked SPIDs + wait time |
-| Long-running sessions | `sys.dm_exec_requests` | user sessions over threshold |
+| Long-running sessions | `sys.dm_exec_requests` | user **queries** actively running over threshold |
+| Long-running transactions | `sys.dm_tran_active_transactions` | **open transactions** over threshold, even if the session is idle/sleeping |
 | Database status | `sys.databases` | anything not `ONLINE` |
 | Error log | `xp_readerrorlog` | error entries in last N hours |
 | CPU usage | scheduler ring buffer | SQL process CPU % |
@@ -85,6 +87,8 @@ All thresholds live in the `$Thresholds` hashtable at the top of the script — 
 ## Notes
 
 - `Send-MailMessage` is deprecated by Microsoft but remains the practical on-prem SMTP-relay standard; swap in MailKit if your shop requires it.
+- **SQL Agent check** uses `sys.dm_server_services`, so it sees the Agent service state even when the database engine is up. A stopped Agent that's set to **Automatic** startup raises WARNING (flip `$Thresholds.AgentStoppedIsCritical` to `$true` for CRITICAL); a stopped Agent on Manual/Disabled startup is treated as intentional and stays OK. When Agent is down, the Failed Agent Jobs check reports "Agent stopped" instead of a misleading "no failed jobs" (nothing runs to fail).
+- **Long-running sessions vs transactions** are two separate checks on purpose. `dm_exec_requests` only shows sessions *actively executing a query right now*, so a `BEGIN TRAN` that never committed (session sleeping / awaiting command) is invisible to it - exactly what `DBCC OPENTRAN` finds. The transactions check keys off `transaction_begin_time` in the tran DMVs, so it catches those idle-but-open transactions (the ones that hold locks and pin the log). Thresholds: `$Thresholds.LongTxnSeconds` / `LongTxnCritSeconds`.
 - The disk check reports only volumes that host database files (the ones that matter). Add a CIM/WMI branch if you want every volume.
 - **Error log**: searches multiple patterns (login failures, `Error:`, Severity 16-25, `failed`, `corrupt`, `deadlock`, `cannot`) so messages like *"Login failed for user 'DevUser'..."* are captured, and shows the full message text. Severe entries (corruption, Severity 20+, I/O errors 823-825, stack dumps) escalate the check to CRITICAL. Tune `$ErrorLogSearchTerms` / `$ErrorLogCriticalTerms` near the top of the script. Note: `xp_readerrorlog` needs **securityadmin** membership (or `GRANT EXECUTE`) on each target - grant it to the monitoring account alongside `VIEW SERVER STATE`.
 
